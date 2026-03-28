@@ -103,6 +103,10 @@ class MergeTask:
     status: str = "pending"     # pending / running / completed / failed / skipped
     error: str = ""             # 失败时的错误信息
     output_path: str = ""       # 输出文件路径
+    source_size: int = 0        # 源文件总大小（字节）
+    output_size: int = 0        # 输出文件大小（字节）
+    start_time: float = 0.0     # 任务开始时间戳
+    end_time: float = 0.0       # 任务结束时间戳
 
 
 # ============================================================
@@ -717,15 +721,52 @@ def merge_blv_videos(ffmpeg_bin: str, blv_paths: list[str], output: str,
 # 进度显示
 # ============================================================
 
-class ProgressDisplay:
-    """终端实时进度显示。"""
+def _fmt_size(n: int) -> str:
+    """格式化字节数为人类可读字符串。"""
+    if n < 1024:
+        return f"{n}B"
+    elif n < 1024 * 1024:
+        return f"{n / 1024:.1f}KB"
+    elif n < 1024 * 1024 * 1024:
+        return f"{n / (1024 * 1024):.1f}MB"
+    else:
+        return f"{n / (1024 * 1024 * 1024):.2f}GB"
 
-    def __init__(self, tasks: list[MergeTask]):
+
+def _fmt_speed(bytes_per_sec: float) -> str:
+    """格式化速度为人类可读字符串。"""
+    if bytes_per_sec <= 0:
+        return "---"
+    return f"{_fmt_size(int(bytes_per_sec))}/s"
+
+
+def _fmt_duration(seconds: float) -> str:
+    """格式化秒数为人类可读时间。"""
+    if seconds < 60:
+        return f"{seconds:.1f}s"
+    elif seconds < 3600:
+        m, s = divmod(int(seconds), 60)
+        return f"{m}m{s:02d}s"
+    else:
+        h, rem = divmod(int(seconds), 3600)
+        m, s = divmod(rem, 60)
+        return f"{h}h{m:02d}m"
+
+
+class ProgressDisplay:
+    """终端实时进度显示。
+    布局（从上到下）：滚动文件列表 → 性能状态 → 进度条。"""
+
+    def __init__(self, tasks: list[MergeTask], scan_duration: float = 0.0,
+                 scan_dir_count: int = 0):
         self.tasks = tasks
+        self.scan_duration = scan_duration
+        self.scan_dir_count = scan_dir_count
         self._lock = threading.Lock()
         self._stop = threading.Event()
         self._thread: threading.Thread | None = None
         self._last_lines = 0
+        self._global_start = time.time()
         # Windows 启用 ANSI 转义
         if sys.platform == "win32":
             os.system("")
@@ -758,53 +799,127 @@ class ProgressDisplay:
             if self._last_lines > 0:
                 self._safe_write(f"\033[{self._last_lines}A\033[J")
 
-            total = len(self.tasks)
-            done = sum(1 for t in self.tasks if t.status == "completed")
-            skipped = sum(1 for t in self.tasks if t.status == "skipped")
-            failed = sum(1 for t in self.tasks if t.status == "failed")
-            running = sum(1 for t in self.tasks if t.status == "running")
-            finished = done + skipped + failed
-            pending = total - finished - running
+            lines = []
 
-            # 进度条
+            # ── 第一区域：滚动文件列表（running + 即将处理的 pending）──
+            try:
+                term_h = os.get_terminal_size().lines
+            except OSError:
+                term_h = 24
+            # 预留 perf stats(3行) + progress(3行) + 余量
+            max_list = max(term_h - 10, 3)
+
+            running_tasks = [t for t in self.tasks if t.status == "running"]
+            pending_tasks = [t for t in self.tasks if t.status == "pending"]
+
+            visible = []
+            for t in running_tasks:
+                visible.append(t)
+            for t in pending_tasks:
+                if len(visible) >= max_list:
+                    break
+                visible.append(t)
+
+            for t in visible:
+                icon = "[合并]" if t.status == "running" else "[等待]"
+                title = t.item.title or "(未知)"
+                if len(title) > 45:
+                    title = title[:42] + "..."
+                info = ""
+                if t.status == "running":
+                    if t.source_size > 0:
+                        info = f"  ({_fmt_size(t.source_size)})"
+                    elapsed = time.time() - t.start_time if t.start_time else 0
+                    if elapsed > 1:
+                        info += f"  {_fmt_duration(elapsed)}"
+                lines.append(f"  {icon} {title}{info}")
+
+            remaining_pending = len(pending_tasks) - max(0, len(visible) - len(running_tasks))
+            if remaining_pending > 0:
+                lines.append(f"  ... 还有 {remaining_pending} 个等待中")
+
+            if not visible and not remaining_pending:
+                lines.append("  (全部处理完毕)")
+
+            lines.append("")
+
+            # ── 第二区域：性能状态信息 ──
+            total = len(self.tasks)
+            done_tasks = [t for t in self.tasks if t.status == "completed"]
+            failed_tasks = [t for t in self.tasks if t.status == "failed"]
+            skipped_tasks = [t for t in self.tasks if t.status == "skipped"]
+            done_count = len(done_tasks)
+            failed_count = len(failed_tasks)
+            skipped_count = len(skipped_tasks)
+            running_count = len(running_tasks)
+            finished = done_count + failed_count + skipped_count
+
+            # 读取速度 / 写入速度 / 平均每集耗时
+            total_source = sum(t.source_size for t in done_tasks)
+            total_output = sum(t.output_size for t in done_tasks)
+            total_proc_time = sum(
+                (t.end_time - t.start_time)
+                for t in done_tasks
+                if t.end_time > t.start_time
+            )
+
+            read_speed = total_source / total_proc_time if total_proc_time > 0 else 0
+            write_speed = total_output / total_proc_time if total_proc_time > 0 else 0
+            avg_per_item = total_proc_time / done_count if done_count > 0 else 0
+
+            perf_parts = []
+            if self.scan_duration > 0:
+                scan_info = f"扫描: {_fmt_duration(self.scan_duration)}"
+                if self.scan_dir_count > 0:
+                    scan_info += f" ({self.scan_dir_count}个目录)"
+                perf_parts.append(scan_info)
+            perf_parts.append(f"读取: {_fmt_speed(read_speed)}")
+            perf_parts.append(f"写入: {_fmt_speed(write_speed)}")
+            if avg_per_item > 0:
+                perf_parts.append(f"转换: {_fmt_duration(avg_per_item)}/集")
+            lines.append(f"  {' | '.join(perf_parts)}")
+
+            # 当前处理文件 / 已完成量 / 预计剩余
+            detail_parts = []
+            if running_tasks:
+                cur = running_tasks[0]
+                cur_title = cur.item.title or "(未知)"
+                if len(cur_title) > 20:
+                    cur_title = cur_title[:17] + "..."
+                cur_info = f"当前: {cur_title}"
+                if cur.source_size > 0:
+                    cur_info += f" ({_fmt_size(cur.source_size)})"
+                detail_parts.append(cur_info)
+
+            if done_count > 0:
+                detail_parts.append(f"已完成: {_fmt_size(total_output)} / {done_count}集")
+
+            remaining = total - finished
+            if avg_per_item > 0 and remaining > 0:
+                # 用实际墙钟时间估算有效并发数，推算剩余时间
+                wall_elapsed = time.time() - self._global_start
+                if wall_elapsed > 1 and finished > 0:
+                    concurrency = max(total_proc_time / wall_elapsed, 1.0)
+                    eta = avg_per_item * remaining / concurrency
+                else:
+                    eta = avg_per_item * remaining
+                detail_parts.append(f"预计剩余: {_fmt_duration(eta)}")
+
+            if detail_parts:
+                lines.append(f"  {' | '.join(detail_parts)}")
+
+            lines.append("")
+
+            # ── 第三区域：进度条（格式与原来一致）──
             pct = finished / total if total else 0
             bar_len = 30
             filled = int(bar_len * pct)
             bar = "#" * filled + "-" * (bar_len - filled)
 
-            lines = []
-            status_parts = f"运行:{running}  完成:{done}  失败:{failed}  等待:{pending}"
-            if skipped:
-                status_parts += f"  跳过:{skipped}"
+            status_parts = f"运行:{running_count}  完成:{done_count}  失败:{failed_count}  等待:{total - finished - running_count}"
+            if skipped_count:
+                status_parts += f"  跳过:{skipped_count}"
             lines.append(f"  [{bar}] {finished}/{total}  {status_parts}")
-            lines.append("")
-
-            # 每个任务的状态
-            try:
-                term_h = os.get_terminal_size().lines - 4
-            except OSError:
-                term_h = 20
-            max_show = max(term_h, 5)
-
-            for i, t in enumerate(self.tasks):
-                if i >= max_show:
-                    lines.append(f"  ... 还有 {total - max_show} 项")
-                    break
-                icon = {
-                    "pending": "[等待]",
-                    "running": "[合并]",
-                    "completed": "[完成]",
-                    "skipped": "[跳过]",
-                    "failed": "[失败]",
-                }.get(t.status, "[?]  ")
-                title = t.item.title or "(未知)"
-                if len(title) > 50:
-                    title = title[:47] + "..."
-                line = f"  {icon} {title}"
-                if t.status == "failed" and t.error:
-                    err_short = t.error[:60].replace('\n', ' ')
-                    line += f"  ({err_short})"
-                lines.append(line)
 
             output = "\n".join(lines) + "\n"
             self._safe_write(output)
@@ -855,8 +970,10 @@ class TaskEngine:
                 ))
         return tasks
 
-    def run(self, tasks: list[MergeTask]):
-        display = ProgressDisplay(tasks)
+    def run(self, tasks: list[MergeTask], scan_duration: float = 0.0,
+            scan_dir_count: int = 0):
+        display = ProgressDisplay(tasks, scan_duration=scan_duration,
+                                  scan_dir_count=scan_dir_count)
         display.start()
 
         try:
@@ -876,8 +993,19 @@ class TaskEngine:
         """处理单个合并任务的完整流程：
         重复检测 → 构建元数据 → 解密(Win/Mac) → ffmpeg合并 → 导出sidecar → 移动/删除源"""
         task.status = "running"
+        task.start_time = time.time()
         item = task.item
         log.info("[任务开始] %s (平台: %s)", item.title or "(未知)", task.platform)
+
+        # 计算源文件总大小
+        src_size = 0
+        for p in [item.audio_path, item.video_path] + (item.blv_paths or []):
+            if p and os.path.isfile(p):
+                try:
+                    src_size += os.path.getsize(p)
+                except OSError:
+                    pass
+        task.source_size = src_size
 
         title = sanitize_filename(item.title) if item.title else str(int(time.time() * 1000))
         group_title = sanitize_filename(task.group_title) if task.group_title else ""
@@ -894,6 +1022,7 @@ class TaskEngine:
         if os.path.isfile(raw_output_path):
             if self.duplicate_mode == "skip":
                 task.status = "skipped"
+                task.end_time = time.time()
                 task.output_path = raw_output_path
                 log.info("[跳过] 文件已存在  %s", raw_output_path)
                 return
@@ -989,10 +1118,16 @@ class TaskEngine:
                 self._delete_source_files(item)
 
             task.status = "completed"
+            task.end_time = time.time()
+            try:
+                task.output_size = os.path.getsize(output_path) if os.path.isfile(output_path) else 0
+            except OSError:
+                task.output_size = 0
             log.info("[转换完成] %s -> %s", item.title or "(未知)", output_path)
 
         except Exception as e:
             task.status = "failed"
+            task.end_time = time.time()
             task.error = str(e)
             log.error("[转换失败] %s: %s", item.title or "(未知)", e)
             # 清理失败的输出文件
@@ -1164,17 +1299,19 @@ def main():
 
     # 扫描
     print(f"扫描目录: {args.input}")
+    scan_start = time.time()
     if platform == "android":
         groups = scan_android_cache(args.input, add_index=args.add_index)
     else:
         groups = scan_windows_cache(args.input, add_index=args.add_index)
+    scan_duration = time.time() - scan_start
 
     if not groups:
         print("未找到任何缓存数据。")
         sys.exit(0)
 
     total_items = sum(len(g.items) for g in groups)
-    print(f"找到 {len(groups)} 个合集, 共 {total_items} 个视频\n")
+    print(f"找到 {len(groups)} 个合集, 共 {total_items} 个视频 (扫描耗时 {scan_duration:.1f}s)\n")
 
     # 列出合集
     for g in groups:
@@ -1248,7 +1385,7 @@ def main():
     log.info("开始合并任务: 共 %d 个, 线程数 %d", len(tasks), args.jobs)
     print(f"开始合并 (线程数: {args.jobs})...\n")
     start_time = time.time()
-    engine.run(tasks)
+    engine.run(tasks, scan_duration=scan_duration, scan_dir_count=total_items)
     elapsed = time.time() - start_time
 
     # 汇总
