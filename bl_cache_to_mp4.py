@@ -320,63 +320,45 @@ def classify_m4s_files(m4s_files: list[str]) -> tuple[str, str] | None:
         return (f2, f1)
 
 
-def _pick_best_quality_dir(episode_dir: Path) -> Path | None:
-    """从分集目录中选择最高画质的子目录。
-
-    B站画质ID对照：6=240P, 16=360P, 32=480P, 64=720P, 80=1080P,
-    112=1080P+, 116=1080P60, 120=4K, 125=HDR, 126=杜比视界, 127=8K。
-    数字越大画质越高。只选包含完整音视频文件的目录，不完整的跳过。"""
-    candidates = []
-    for sub in episode_dir.iterdir():
-        if not sub.is_dir():
-            continue
-        # 画质目录名是纯数字
-        if not sub.name.isdigit():
-            continue
-        # 必须有 audio.m4s + video.m4s 或 .blv 文件
-        has_audio = (sub / "audio.m4s").is_file()
-        has_video = (sub / "video.m4s").is_file()
-        has_blv = any(f.name.endswith(".blv") for f in sub.iterdir() if f.is_file())
-        if (has_audio and has_video) or has_blv:
-            candidates.append((int(sub.name), sub))
-    if not candidates:
-        return None
-    # 选画质ID最大的
-    candidates.sort(key=lambda x: x[0], reverse=True)
-    return candidates[0][1]
+def _scan_quality_dir(quality_path: str) -> dict:
+    """单次 scandir 扫描一个画质目录，返回文件信息。"""
+    audio = video = ""
+    blv_files = []
+    try:
+        with os.scandir(quality_path) as it:
+            for entry in it:
+                if not entry.is_file(follow_symlinks=False):
+                    continue
+                name = entry.name
+                if name == "audio.m4s":
+                    audio = entry.path
+                elif name == "video.m4s":
+                    video = entry.path
+                elif name.endswith(".blv"):
+                    blv_files.append(entry.path)
+    except (PermissionError, OSError):
+        pass
+    return {"audio": audio, "video": video, "blv": blv_files}
 
 
-def scan_android_cache(root_dir: str, add_index: bool = True) -> list[CacheGroup]:
-    """扫描 Android 缓存目录。
-    目录结构：根目录/{合集ID}/{分集ID}/entry.json + {画质ID}/audio.m4s + video.m4s
-    自动选择最高画质目录，按合集分组，组内按分P排序。"""
-    items = []
-    root = Path(root_dir)
-    if not root.is_dir():
-        return []
+def _scan_android_episode(second_dir_path: str, first_dir_path: str) -> CacheItem | None:
+    """扫描单个 Android 分集目录，返回 CacheItem 或 None。
+    单次 os.scandir 同时收集文件和子目录，最小化系统调用。"""
+    item = CacheItem()
+    item.parent_path = first_dir_path
+    item.path = second_dir_path
 
-    for first_dir in sorted(root.iterdir()):
-        if not first_dir.is_dir():
-            continue
-        for second_dir in sorted(first_dir.iterdir()):
-            if not second_dir.is_dir():
-                continue
-            item = CacheItem()
-            item.parent_path = str(first_dir)
-            item.path = str(second_dir)
-            blv_files = []
-
-            try:
-                # 解析顶层文件（entry.json, danmaku.xml, cover.jpg）
-                for f in second_dir.iterdir():
-                    if not f.is_file():
-                        continue
-                    name = f.name
-                    fp = str(f)
+    # 单次 scandir：同时收集顶层文件和子目录列表
+    subdirs = []  # (name, path) — 数字目录和非数字目录都收集
+    try:
+        with os.scandir(second_dir_path) as it:
+            for entry in it:
+                if entry.is_file(follow_symlinks=False):
+                    name = entry.name
                     if name == "entry.json":
-                        item.json_path = fp
+                        item.json_path = entry.path
                         try:
-                            info = parse_android_json(fp)
+                            info = parse_android_json(entry.path)
                             item.av_id = info.get("av_id", "")
                             item.bv_id = info.get("bv_id", "")
                             item.title = info.get("title", "")
@@ -385,102 +367,171 @@ def scan_android_cache(root_dir: str, add_index: bool = True) -> list[CacheGroup
                             item.group_title = info.get("group_title", "")
                             item.owner_name = info.get("owner_name", "")
                         except Exception as e:
-                            print(f"  [警告] 解析 {fp} 失败: {e}")
+                            print(f"  [警告] 解析 {entry.path} 失败: {e}")
                     elif name == "danmaku.xml":
-                        item.danmaku_path = fp
+                        item.danmaku_path = entry.path
                     elif name == "cover.jpg":
-                        item.cover_path = fp
+                        item.cover_path = entry.path
+                elif entry.is_dir(follow_symlinks=False):
+                    subdirs.append((entry.name, entry.path))
+    except (PermissionError, OSError):
+        return None
 
-                # 选择最高画质目录
-                best_dir = _pick_best_quality_dir(second_dir)
-                if best_dir:
-                    for f in best_dir.iterdir():
-                        if not f.is_file():
-                            continue
-                        name = f.name
-                        fp = str(f)
-                        if name == "audio.m4s":
-                            item.audio_path = fp
-                        elif name == "video.m4s":
-                            item.video_path = fp
-                        elif name.endswith(".blv"):
-                            blv_files.append(fp)
-                else:
-                    # 没有画质子目录，用 rglob 兜底（兼容非标准结构）
-                    for f in second_dir.rglob("*"):
-                        if not f.is_file():
-                            continue
-                        name = f.name
-                        fp = str(f)
-                        if name == "audio.m4s":
-                            item.audio_path = fp
-                        elif name == "video.m4s":
-                            item.video_path = fp
-                        elif name.endswith(".blv"):
-                            blv_files.append(fp)
-            except PermissionError:
-                continue
+    # 从子目录中选择最高画质（数字目录名 = 画质 ID）
+    candidates = []
+    fallback_dirs = []
+    for name, path in subdirs:
+        if name.isdigit():
+            info = _scan_quality_dir(path)
+            if (info["audio"] and info["video"]) or info["blv"]:
+                candidates.append((int(name), info))
+        else:
+            fallback_dirs.append(path)
 
-            if blv_files:
-                item.blv_paths = blv_files
+    if candidates:
+        candidates.sort(key=lambda x: x[0], reverse=True)
+        best = candidates[0][1]
+        item.audio_path = best["audio"]
+        item.video_path = best["video"]
+        item.blv_paths = best["blv"]
+    else:
+        # 兜底：非数字目录中查找音视频文件（找到即停）
+        for fb_path in fallback_dirs:
+            fb = _scan_quality_dir(fb_path)
+            if (fb["audio"] and fb["video"]) or fb["blv"]:
+                item.audio_path = fb["audio"]
+                item.video_path = fb["video"]
+                item.blv_paths = fb["blv"]
+                break
 
-            if item.can_merge():
-                item.group_id = str(first_dir)
-                item.group_cover_path = item.cover_path
-                items.append(item)
+    if item.can_merge():
+        item.group_id = first_dir_path
+        item.group_cover_path = item.cover_path
+        return item
+    return None
+
+
+def _scan_android_group(first_dir_path: str) -> list[CacheItem]:
+    """扫描单个 Android 合集目录下的所有分集。"""
+    items = []
+    try:
+        with os.scandir(first_dir_path) as it:
+            for entry in it:
+                if entry.is_dir(follow_symlinks=False):
+                    result = _scan_android_episode(entry.path, first_dir_path)
+                    if result:
+                        items.append(result)
+    except (PermissionError, OSError):
+        pass
+    return items
+
+
+def scan_android_cache(root_dir: str, add_index: bool = True) -> list[CacheGroup]:
+    """扫描 Android 缓存目录。
+    目录结构：根目录/{合集ID}/{分集ID}/entry.json + {画质ID}/audio.m4s + video.m4s
+    自动选择最高画质目录，按合集分组，组内按分P排序。
+    使用 os.scandir 减少系统调用，多线程并行扫描各合集目录。"""
+    if not os.path.isdir(root_dir):
+        return []
+
+    # 收集一级目录
+    group_dirs = []
+    try:
+        with os.scandir(root_dir) as it:
+            for entry in it:
+                if entry.is_dir(follow_symlinks=False):
+                    group_dirs.append(entry.path)
+    except (PermissionError, OSError):
+        return []
+
+    # 多线程并行扫描各合集目录
+    items = []
+    with ThreadPoolExecutor(max_workers=8) as pool:
+        futures = {pool.submit(_scan_android_group, d): d for d in group_dirs}
+        for future in as_completed(futures):
+            try:
+                batch = future.result()
+                items.extend(batch)
+            except Exception as e:
+                print(f"  [警告] 扫描目录失败: {futures[future]}: {e}")
 
     return _group_items(items, add_index)
+
+
+def _scan_windows_episode(first_dir_path: str, root_dir: str) -> CacheItem | None:
+    """扫描单个 Windows/Mac 分集目录，返回 CacheItem 或 None。"""
+    item = CacheItem()
+    item.parent_path = root_dir
+    item.path = first_dir_path
+    m4s_files = []
+
+    try:
+        with os.scandir(first_dir_path) as it:
+            for entry in it:
+                if not entry.is_file(follow_symlinks=False):
+                    continue
+                name = entry.name
+                if name.endswith(".videoInfo"):
+                    item.json_path = entry.path
+                    try:
+                        info = parse_windows_json(entry.path)
+                        item.av_id = info.get("av_id", "")
+                        item.bv_id = info.get("bv_id", "")
+                        item.title = info.get("title", "")
+                        item.p = info.get("p")
+                        item.group_id = info.get("group_id", "")
+                        item.group_title = info.get("group_title", "")
+                        item.group_cover_path = info.get("group_cover_path", "")
+                        item.owner_name = info.get("owner_name", "")
+                    except Exception as e:
+                        print(f"  [警告] 解析 {entry.path} 失败: {e}")
+                elif name.endswith(".dm1"):
+                    item.danmaku_path = entry.path
+                elif name.endswith(".m4s"):
+                    m4s_files.append(entry.path)
+                elif name == "group.jpg":
+                    item.group_cover_path = entry.path
+                elif name == "image.jpg":
+                    item.cover_path = entry.path
+    except (PermissionError, OSError):
+        return None
+
+    av = classify_m4s_files(m4s_files)
+    if av:
+        item.audio_path, item.video_path = av
+        return item
+    return None
 
 
 def scan_windows_cache(root_dir: str, add_index: bool = True) -> list[CacheGroup]:
     """扫描 Windows/Mac 缓存目录。
     目录结构：根目录/{分集ID}/.videoInfo + 两个.m4s文件
-    按 groupId 分组，组内按分P排序。"""
-    items = []
-    root = Path(root_dir)
-    if not root.is_dir():
+    按 groupId 分组，组内按分P排序。
+    使用 os.scandir 减少系统调用，多线程并行扫描各分集目录。"""
+    if not os.path.isdir(root_dir):
         return []
 
-    for first_dir in sorted(root.iterdir()):
-        if not first_dir.is_dir():
-            continue
-        item = CacheItem()
-        item.parent_path = str(root)
-        item.path = str(first_dir)
-        m4s_files = []
+    # 收集一级目录
+    episode_dirs = []
+    try:
+        with os.scandir(root_dir) as it:
+            for entry in it:
+                if entry.is_dir(follow_symlinks=False):
+                    episode_dirs.append(entry.path)
+    except (PermissionError, OSError):
+        return []
 
-        for f in first_dir.iterdir():
-            if not f.is_file():
-                continue
-            name = f.name
-            fp = str(f)
-            if name.endswith(".videoInfo"):
-                item.json_path = fp
-                try:
-                    info = parse_windows_json(fp)
-                    item.av_id = info.get("av_id", "")
-                    item.bv_id = info.get("bv_id", "")
-                    item.title = info.get("title", "")
-                    item.p = info.get("p")
-                    item.group_id = info.get("group_id", "")
-                    item.group_title = info.get("group_title", "")
-                    item.group_cover_path = info.get("group_cover_path", "")
-                    item.owner_name = info.get("owner_name", "")
-                except Exception as e:
-                    print(f"  [警告] 解析 {fp} 失败: {e}")
-            elif name.endswith(".dm1"):
-                item.danmaku_path = fp
-            elif name.endswith(".m4s"):
-                m4s_files.append(fp)
-            elif name == "group.jpg":
-                item.group_cover_path = fp
-            elif name == "image.jpg":
-                item.cover_path = fp
-
-        av = classify_m4s_files(m4s_files)
-        if av:
-            item.audio_path, item.video_path = av
-            items.append(item)
+    # 多线程并行扫描各分集目录
+    items = []
+    with ThreadPoolExecutor(max_workers=8) as pool:
+        futures = {pool.submit(_scan_windows_episode, d, root_dir): d for d in episode_dirs}
+        for future in as_completed(futures):
+            try:
+                result = future.result()
+                if result:
+                    items.append(result)
+            except Exception as e:
+                print(f"  [警告] 扫描目录失败: {futures[future]}: {e}")
 
     return _group_items(items, add_index)
 
@@ -516,27 +567,34 @@ def _group_items(items: list[CacheItem], add_index: bool) -> list[CacheGroup]:
 
 
 def auto_detect_platform(root_dir: str, max_check: int = 10) -> str:
-    """自动检测缓存格式。只检查前几个目录，快速返回。"""
-    root = Path(root_dir)
+    """自动检测缓存格式。只检查前几个目录，快速返回。使用 os.scandir 减少系统调用。"""
     checked = 0
-    for d in root.iterdir():
-        if not d.is_dir():
-            continue
-        if checked >= max_check:
-            break
-        checked += 1
-        try:
-            for f in d.iterdir():
-                if f.name.endswith(".videoInfo"):
-                    return "windows"
-                if f.is_dir():
-                    # 只检查第一个子目录
-                    for ff in f.iterdir():
-                        if ff.name == "entry.json":
-                            return "android"
+    try:
+        with os.scandir(root_dir) as root_it:
+            for d in root_it:
+                if not d.is_dir(follow_symlinks=False):
+                    continue
+                if checked >= max_check:
                     break
-        except PermissionError:
-            continue
+                checked += 1
+                try:
+                    with os.scandir(d.path) as sub_it:
+                        for f in sub_it:
+                            if f.is_file(follow_symlinks=False) and f.name.endswith(".videoInfo"):
+                                return "windows"
+                            if f.is_dir(follow_symlinks=False):
+                                try:
+                                    with os.scandir(f.path) as inner_it:
+                                        for ff in inner_it:
+                                            if ff.name == "entry.json":
+                                                return "android"
+                                except (PermissionError, OSError):
+                                    pass
+                                break
+                except (PermissionError, OSError):
+                    continue
+    except (PermissionError, OSError):
+        pass
     return "windows"
 
 

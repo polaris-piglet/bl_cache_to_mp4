@@ -11,12 +11,15 @@ bl_cache_to_mp4.py
 │
 ├── JSON 解析 ───────── try_parse_json（容错解析）
 │
-├── 缓存扫描器
-│   ├── _pick_best_quality_dir() ← 多画质目录选最高画质
-│   ├── scan_android_cache()     ← Android 缓存（entry.json）
-│   ├── scan_windows_cache()     ← Windows/Mac 缓存（.videoInfo）
-│   ├── auto_detect_platform()   ← 自动检测缓存格式（快速检查前10个目录）
-│   └── _group_items()           ← 按合集分组 + 排序
+├── 缓存扫描器（os.scandir + 多线程并行，SMB/NAS 友好）
+│   ├── _scan_quality_dir()          ← 单次 scandir 扫描画质目录
+│   ├── _scan_android_episode()      ← 单次 scandir 扫描分集（文件+子目录一次收集）
+│   ├── _scan_android_group()        ← 扫描合集下所有分集
+│   ├── scan_android_cache()         ← Android 缓存（8线程并行扫描合集）
+│   ├── _scan_windows_episode()      ← 单次 scandir 扫描分集
+│   ├── scan_windows_cache()         ← Windows/Mac 缓存（8线程并行扫描分集）
+│   ├── auto_detect_platform()       ← 自动检测缓存格式（快速检查前10个目录）
+│   └── _group_items()               ← 按合集分组 + 排序
 │
 ├── 解密模块 ────────── decrypt_pc_m4s()（Windows/Mac m4s 头部处理）
 │
@@ -52,9 +55,10 @@ bl_cache_to_mp4.py
           ▼
 ┌─────────────────────┐
 │    扫描缓存目录       │ ← scan_android_cache() / scan_windows_cache()
-│  遍历目录结构         │
+│  8线程并行扫描        │   ThreadPoolExecutor(max_workers=8)
+│  os.scandir 单次遍历  │   每个目录只扫一次，同时收集文件和子目录
 │  解析 JSON 元数据     │   parse_android_json() / parse_windows_json()
-│  选择最高画质目录     │   _pick_best_quality_dir()
+│  选择最高画质目录     │   _scan_quality_dir() → 按画质ID降序取最高
 │  识别音视频文件       │   classify_m4s_files()
 │  收集弹幕/封面路径    │
 └─────────┬───────────┘
@@ -192,10 +196,12 @@ bl_cache_to_mp4.py
 
 **多画质选择算法：**
 
-同一分集可能缓存了多个画质。脚本通过 `_pick_best_quality_dir()` 选择最佳画质：
-1. 遍历分集目录下所有纯数字命名的子目录（画质ID）
-2. 过滤掉不完整的目录（缺少 audio.m4s + video.m4s 或 .blv 文件）
-3. 选择画质ID最大的目录（数字越大画质越高）
+同一分集可能缓存了多个画质。`_scan_android_episode()` 在单次 `os.scandir` 中同时收集顶层文件和子目录列表，然后对数字命名的子目录调用 `_scan_quality_dir()` 选择最佳画质：
+1. 单次 scandir 分集目录，同时收集文件（entry.json 等）和子目录列表
+2. 对数字命名的子目录，各调一次 `_scan_quality_dir()` 获取音视频文件路径
+3. 过滤掉不完整的目录（缺少 audio.m4s + video.m4s 或 .blv 文件）
+4. 选择画质ID最大的目录（数字越大画质越高）
+5. 兜底：如果没有数字目录，扫描非数字子目录查找音视频文件（找到即停）
 
 画质ID对照：6=240P, 16=360P, 32=480P, 64=720P, 80=1080P, 112=1080P+, 116=1080P60, 120=4K, 125=HDR, 126=杜比视界, 127=8K
 
@@ -380,12 +386,24 @@ BLV 文件在拼接前会按文件名中的数字排序：
 sorted(blv_paths, key=lambda p: int(re.search(r'(\d+)\.blv$', p).group(1)))
 ```
 
-## 7. 多线程模型
+## 7. 多线��模型
 
-### 线程池
+### 扫描阶段线程池
 
 ```python
-ThreadPoolExecutor(max_workers=N)
+ThreadPoolExecutor(max_workers=8)
+```
+
+- **Android**：每个合集目录（一级目录）作为独立任务并行扫描
+- **Windows/Mac**：每个分集目录作为独立任务并行扫描
+- 使用 `os.scandir` 代替 `Path.iterdir()`，减少系统调用（SMB 上每次 scandir 是一次网络往返，而 `iterdir()` + `is_file()` 需要 N+1 次）
+- 每个分集目录只做一次 scandir，同时收集文件和子目录列表
+- 单个任务异常不影响其他任务（`try/except` 包裹 `future.result()`）
+
+### 合并阶段线程池
+
+```python
+ThreadPoolExecutor(max_workers=N)  # N 由 --jobs 参数指定，默认 2
 ```
 
 - 每个 `MergeTask` 作为独立任务提交到线程池
@@ -432,7 +450,7 @@ ThreadPoolExecutor(max_workers=N)
 | `[解密]` | Windows/Mac m4s 文件解密 |
 | `[删除]` | 源文件夹、空父目录、失败产物、临时文件 |
 | `[移动]` | 文件移动到完成目录 |
-| `[导��]` | 封面/元数据/弹幕导出 |
+| `[导出]` | 封面/元数据/弹幕导出 |
 | `[跳过]` | 跳过已存在的文件 |
 | `===== 任务汇总 =====` | 最终统计（成功/失败/跳过/耗时） |
 
