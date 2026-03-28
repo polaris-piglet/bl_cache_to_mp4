@@ -14,6 +14,7 @@ __version__ = "1.0.0"
 
 import argparse
 import json
+import logging
 import os
 import re
 import shutil
@@ -24,6 +25,34 @@ import time
 from concurrent.futures import ThreadPoolExecutor, as_completed
 from dataclasses import dataclass, field
 from pathlib import Path
+
+
+# ============================================================
+# 日志配置
+# ============================================================
+
+def _setup_logger() -> logging.Logger:
+    """初始化日志系统，日志文件写入 ./log/ 目录，按日期命名。"""
+    script_dir = os.path.dirname(os.path.abspath(__file__))
+    log_dir = os.path.join(script_dir, "log")
+    os.makedirs(log_dir, exist_ok=True)
+
+    log_file = os.path.join(log_dir, time.strftime("%Y-%m-%d_%H%M%S") + ".log")
+
+    logger = logging.getLogger("bl_cache_to_mp4")
+    logger.setLevel(logging.DEBUG)
+
+    fh = logging.FileHandler(log_file, encoding="utf-8")
+    fh.setLevel(logging.DEBUG)
+    fh.setFormatter(logging.Formatter(
+        "%(asctime)s  %(levelname)-7s  %(message)s",
+        datefmt="%Y-%m-%d %H:%M:%S",
+    ))
+    logger.addHandler(fh)
+    return logger
+
+
+log = _setup_logger()
 
 
 # ============================================================
@@ -531,8 +560,10 @@ def decrypt_pc_m4s(src_path: str, dst_path: str, buf_size: int = 256 * 1024 * 10
                 if not chunk:
                     break
                 fout.write(chunk)
+        log.info("[解密] 成功  %s -> %s", src_path, dst_path)
         return True
     except Exception as e:
+        log.error("[解密] 失败  %s: %s", src_path, e)
         print(f"  [解密失败] {src_path}: {e}")
         return False
 
@@ -552,15 +583,21 @@ def _build_metadata_args(metadata: dict[str, str]) -> list[str]:
 
 def _run_ffmpeg(cmd: list[str]) -> tuple[bool, str]:
     """执行 ffmpeg 命令，返回 (成功, 错误信息)。"""
+    log.debug("[FFmpeg] 执行命令: %s", " ".join(cmd))
     try:
         r = subprocess.run(cmd, capture_output=True, text=True, timeout=600,
                            encoding="utf-8", errors="replace")
         if r.returncode == 0:
+            log.info("[FFmpeg] 成功  %s", cmd[-1])
             return (True, "")
-        return (False, r.stderr[-500:] if r.stderr else f"returncode={r.returncode}")
+        err = r.stderr[-500:] if r.stderr else f"returncode={r.returncode}"
+        log.error("[FFmpeg] 失败  %s: %s", cmd[-1], err)
+        return (False, err)
     except subprocess.TimeoutExpired:
+        log.error("[FFmpeg] 超时(600s)  %s", cmd[-1])
         return (False, "ffmpeg 超时(600s)")
     except Exception as e:
+        log.error("[FFmpeg] 异常  %s: %s", cmd[-1], e)
         return (False, str(e))
 
 
@@ -782,6 +819,7 @@ class TaskEngine:
         重复检测 → 构建元数据 → 解密(Win/Mac) → ffmpeg合并 → 导出sidecar → 移动/删除源"""
         task.status = "running"
         item = task.item
+        log.info("[任务开始] %s (平台: %s)", item.title or "(未知)", task.platform)
 
         title = sanitize_filename(item.title) if item.title else str(int(time.time() * 1000))
         group_title = sanitize_filename(task.group_title) if task.group_title else ""
@@ -799,6 +837,7 @@ class TaskEngine:
             if self.duplicate_mode == "skip":
                 task.status = "skipped"
                 task.output_path = raw_output_path
+                log.info("[跳过] 文件已存在  %s", raw_output_path)
                 return
             elif self.duplicate_mode == "overwrite":
                 output_path = raw_output_path
@@ -865,16 +904,19 @@ class TaskEngine:
             if self.export_cover and cover:
                 cover_dest = change_ext(output_path, "jpg")
                 shutil.copy2(cover, cover_dest)
+                log.info("[导出] 封面  %s", cover_dest)
 
             # 导出原始元数据
             if self.export_info and item.json_path and os.path.isfile(item.json_path):
                 info_dest = change_ext(output_path, "info.json")
                 shutil.copy2(item.json_path, info_dest)
+                log.info("[导出] 元数据  %s", info_dest)
 
             # 导出弹幕
             if self.export_danmaku and item.danmaku_path and os.path.isfile(item.danmaku_path):
                 danmaku_dest = change_ext(output_path, "xml")
                 shutil.copy2(item.danmaku_path, danmaku_dest)
+                log.info("[导出] 弹幕  %s", danmaku_dest)
 
             # 移动到完成目录（MP4 + 所有 sidecar 文件）
             if self.move_completed and self.completed_dir:
@@ -889,14 +931,17 @@ class TaskEngine:
                 self._delete_source_files(item)
 
             task.status = "completed"
+            log.info("[转换完成] %s -> %s", item.title or "(未知)", output_path)
 
         except Exception as e:
             task.status = "failed"
             task.error = str(e)
+            log.error("[转换失败] %s: %s", item.title or "(未知)", e)
             # 清理失败的输出文件
             if os.path.isfile(output_path):
                 try:
                     os.remove(output_path)
+                    log.info("[删除] 失败产物  %s", output_path)
                 except OSError:
                     pass
         finally:
@@ -905,6 +950,7 @@ class TaskEngine:
                 try:
                     if os.path.isfile(tf):
                         os.remove(tf)
+                        log.debug("[删除] 临时文件  %s", tf)
                 except OSError:
                     pass
 
@@ -919,7 +965,9 @@ class TaskEngine:
             filename = os.path.basename(filepath)
             dest_path = get_available_path(os.path.join(dest_dir, filename))
             shutil.move(filepath, dest_path)
+            log.info("[移动] %s -> %s", filepath, dest_path)
         except Exception as e:
+            log.error("[移动] 失败  %s: %s", filepath, e)
             print(f"  [移动失败] {filepath}: {e}")
 
     def _delete_source_files(self, item: CacheItem):
@@ -930,7 +978,9 @@ class TaskEngine:
             return
         try:
             shutil.rmtree(source_dir)
+            log.info("[删除] 源文件夹  %s", source_dir)
         except Exception as e:
+            log.error("[删除] 源文件夹失败  %s: %s", source_dir, e)
             print(f"  [删除源文件夹失败] {source_dir}: {e}")
             return
 
@@ -940,6 +990,7 @@ class TaskEngine:
             try:
                 if not os.listdir(parent_dir):
                     os.rmdir(parent_dir)
+                    log.info("[删除] 空父目录  %s", parent_dir)
             except Exception:
                 pass
 
@@ -1136,6 +1187,7 @@ def main():
     tasks = engine.build_tasks(groups, platform)
 
     # 执行
+    log.info("开始合并任务: 共 %d 个, 线程数 %d", len(tasks), args.jobs)
     print(f"开始合并 (线程数: {args.jobs})...\n")
     start_time = time.time()
     engine.run(tasks)
@@ -1145,6 +1197,16 @@ def main():
     done = [t for t in tasks if t.status == "completed"]
     skipped = [t for t in tasks if t.status == "skipped"]
     failed = [t for t in tasks if t.status == "failed"]
+
+    summary_msg = f"成功: {len(done)}  失败: {len(failed)}"
+    if skipped:
+        summary_msg += f"  跳过: {len(skipped)}"
+    summary_msg += f"  总计: {len(tasks)}  耗时: {elapsed:.1f}s"
+    log.info("===== 任务汇总 =====  %s", summary_msg)
+
+    if failed:
+        for t in failed:
+            log.error("[失败详情] %s: %s", t.item.title, t.error)
 
     print(f"\n{'=' * 50}")
     print(f"完成! 耗时 {elapsed:.1f}s")

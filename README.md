@@ -17,6 +17,7 @@
 - [x] 重复文件检测（跳过/覆盖/副本三选一）
 - [x] 可选导出弹幕、封面、原始元数据
 - [x] 可选转换后删除源缓存 / 移动到完成目录
+- [x] 操作日志自动记录到 `./log/` 目录（转换、删除、移动等）
 - [x] 零外部依赖（仅需 Python 标准库 + ffmpeg）
 - [x] 跨平台（Windows / Linux / macOS）
 
@@ -55,6 +56,7 @@ python bl_cache_to_mp4.py -i E:\videos -o E:\output -p android -j 4 --danmaku --
 |------|------|
 | `bl_cache_to_mp4.py` | 主脚本 |
 | `ffmpeg.exe` + `*.dll` | ffmpeg 引擎及依赖（Windows，v4.3.1） |
+| `log/` | 运行日志目录（自动创建，按时间命名） |
 | [USAGE.md](USAGE.md) | 详细使用指南（参数、场景、风险提示、FAQ） |
 | [DESIGN.md](DESIGN.md) | 设计与算法文档 |
 | [LICENSE.txt](LICENSE.txt) | CC BY-NC-SA 4.0 开源协议 |
