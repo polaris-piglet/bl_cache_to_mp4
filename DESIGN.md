@@ -1,0 +1,458 @@
+# bl_cache_to_mp4 设计与算法文档
+
+## 1. 架构概览
+
+```
+bl_cache_to_mp4.py
+│
+├── 数据类 ─────────── CacheItem / CacheGroup / MergeTask
+│
+├── 文件工具 ────────── sanitize_filename / get_available_path(线程安全) / change_ext
+│
+├── JSON 解析 ───────── try_parse_json（容错解析）
+│
+├── 缓存扫描器
+│   ├── _pick_best_quality_dir() ← 多画质目录选最高画质
+│   ├── scan_android_cache()     ← Android 缓存（entry.json）
+│   ├── scan_windows_cache()     ← Windows/Mac 缓存（.videoInfo）
+│   ├── auto_detect_platform()   ← 自动检测缓存格式（快速检查前10个目录）
+│   └── _group_items()           ← 按合集分组 + 排序
+│
+├── 解密模块 ────────── decrypt_pc_m4s()（Windows/Mac m4s 头部处理）
+│
+├── FFmpeg 合并（自动嵌入封面 + 元数据）
+│   ├── merge_audio_video()    ← 音频 + 视频 → MP4
+│   └── merge_blv_videos()     ← 多段 BLV → MP4
+│
+├── 任务引擎 ────────── TaskEngine
+│   ├── 重复检测（跳过/覆盖/副本）
+│   ├── 多线程调度（ThreadPoolExecutor）
+│   ├── 后处理：导出 sidecar 文件（弹幕/封面/info.json）
+│   ├── 后处理：移动到完成目录 或 删除源缓存文件夹
+│   └── 删除源时自动清理空的合集目录
+│
+├── 进度显示 ────────── ProgressDisplay（终端实时刷新，GBK 安全）
+│
+└── CLI 入口 ────────── main()（argparse + 互斥校验 + 重复检测交互）
+```
+
+## 2. 数据流
+
+```
+用户输入缓存目录路径
+        │
+        ▼
+┌─────────────────────┐
+│    自动检测格式       │ ← auto_detect_platform()
+│  Android / Windows   │   查找 entry.json 或 .videoInfo
+└─────────┬───────────┘
+          │
+          ▼
+┌─────────────────────┐
+│    扫描缓存目录       │ ← scan_android_cache() / scan_windows_cache()
+│  遍历目录结构         │
+│  解析 JSON 元数据     │   parse_android_json() / parse_windows_json()
+│  选择最高画质目录     │   _pick_best_quality_dir()
+│  识别音视频文件       │   classify_m4s_files()
+│  收集弹幕/封面路径    │
+└─────────┬───────────┘
+          │
+          ▼
+┌─────────────────────┐
+│    分组 + 排序        │ ← _group_items()
+│  按 group_id 聚合     │
+│  组内按 p(分P) 排序   │
+│  可选添加序号前缀     │
+└─────────┬───────────┘
+          │
+          ▼
+    显示扫描结果
+    用户确认 (y/N)
+          │
+          ▼
+┌─────────────────────┐
+│   检测重复文件        │ ← _detect_duplicates()
+│   提示：跳过/覆盖/副本│
+└─────────┬───────────┘
+          │
+          ▼
+┌─────────────────────┐
+│    构建任务列表       │ ← TaskEngine.build_tasks()
+│  每个 CacheItem      │
+│  → 一个 MergeTask    │
+└─────────┬───────────┘
+          │
+          ▼
+┌─────────────────────────────────────────┐
+│         多线程执行（ThreadPoolExecutor）   │
+│                                         │
+│  线程1: ┌───────────────────────┐       │
+│         │ Windows/Mac?          │       │
+│         │  → 解密 m4s → 临时文件 │       │
+│         │  → ffmpeg 合并        │       │
+│         │  → 删除临时文件       │       │
+│         │                       │       │
+│         │ Android?              │       │
+│         │  → ffmpeg 直接合并    │       │
+│         │                       │       │
+│         │ BLV?                  │       │
+│         │  → ffmpeg concat 拼接 │       │
+│         │                       │       │
+│         │ → 导出 sidecar 文件     │       │
+│         │   (弹幕/封面/info.json)│       │
+│         │ → 移动到完成目录（可选）│       │
+│         │ → 删除源文件夹（可选） │       │
+│         │   → 清理空合集目录     │       │
+│         └───────────────────────┘       │
+│                                         │
+│  线程2: （同上，处理另一个任务）          │
+│  ...                                    │
+│                                         │
+│  ProgressDisplay: 每 0.5s 刷新终端状态    │
+└─────────────────┬───────────────────────┘
+                  │
+                  ▼
+           打印最终汇总
+      成功数 / 失败数 / 耗时
+         列出失败详情
+```
+
+## 3. 数据模型
+
+### CacheItem（单个视频）
+
+| 字段 | 类型 | 说明 |
+|------|------|------|
+| path | str | 缓存项目录路径 |
+| parent_path | str | 父目录路径 |
+| json_path | str | 元数据文件路径（entry.json 或 .videoInfo） |
+| audio_path | str | 音频文件路径 |
+| video_path | str | 视频文件路径 |
+| blv_paths | list[str] | BLV 分段文件路径列表 |
+| danmaku_path | str | 弹幕文件路径（.xml 或 .dm1） |
+| cover_path | str | 封面图片路径 |
+| title | str | 视频标题 |
+| group_id | str | 合集 ID（用于分组） |
+| group_title | str | 合集标题 |
+| p | int \| None | 分P编号 |
+| av_id / bv_id / c_id | str | B站视频标识符 |
+| owner_name | str | UP主名 |
+
+可合并条件（`can_merge()`）：`(audio_path AND video_path) OR blv_paths 非空`
+
+### CacheGroup（合集）
+
+| 字段 | 类型 | 说明 |
+|------|------|------|
+| group_id | str | 合集唯一标识 |
+| title | str | 合集标题 |
+| path | str | 合集目录路径 |
+| items | list[CacheItem] | 组内视频列表（已按 p 排序） |
+
+### MergeTask（合并任务）
+
+| 字段 | 类型 | 说明 |
+|------|------|------|
+| item | CacheItem | 要合并的视频 |
+| group_title | str | 所属合集标题（用于输出子目录名） |
+| platform | str | 缓存来源平台 |
+| status | str | 任务状态：pending → running → completed/failed/skipped |
+| error | str | 失败时的错误信息 |
+| output_path | str | 输出文件路径 |
+
+## 4. 缓存格式解析
+
+### 4.1 Android 缓存
+
+**目录结构：**
+
+```
+根目录/
+├── {group_id_1}/                    ← 第一层：合集 ID（数字目录名）
+│   ├── c_{episode_id_1}/           ← 第二层：分集目录
+│   │   ├── entry.json              ← 元数据（标题、ID、分P号）
+│   │   ├── danmaku.xml             ← 弹幕文件
+│   │   ├── cover.jpg               ← 封面图
+│   │   ├── 64/                     ← 画质目录（720P）
+│   │   │   ├── audio.m4s
+│   │   │   ├── video.m4s
+│   │   │   └── index.json
+│   │   └── 80/                     ← 画质目录（1080P），可能同时存在多个
+│   │       ├── audio.m4s
+│   │       ├── video.m4s
+│   │       └── index.json
+│   └── c_{episode_id_2}/
+│       └── ...
+└── {group_id_2}/
+    └── ...
+```
+
+**多画质选择算法：**
+
+同一分集可能缓存了多个画质。脚本通过 `_pick_best_quality_dir()` 选择最佳画质：
+1. 遍历分集目录下所有纯数字命名的子目录（画质ID）
+2. 过滤掉不完整的目录（缺少 audio.m4s + video.m4s 或 .blv 文件）
+3. 选择画质ID最大的目录（数字越大画质越高）
+
+画质ID对照：6=240P, 16=360P, 32=480P, 64=720P, 80=1080P, 112=1080P+, 116=1080P60, 120=4K, 125=HDR, 126=杜比视界, 127=8K
+
+**也可能是 BLV 格式（旧版缓存）：**
+
+```
+{episode_dir}/
+├── entry.json
+└── {quality}/
+    ├── 0.blv          ← 视频分段1
+    ├── 1.blv          ← 视频分段2
+    └── ...
+```
+
+**entry.json 字段提取：**
+
+```python
+# 优先级：page_data → ep → 根级字段
+title = page_data.part          # 普通视频的分P标题
+     or ep.index_title          # 番剧的集标题
+     or data.title              # 视频总标题
+     or bvid / avid / cid       # 最终回退
+
+p     = page_data.page          # 普通视频的分P号
+     or ep.index / ep.page      # 番剧的集号
+
+group_title = data.title        # 合集标题
+group_id    = 第一层目录路径     # 用目录路径作为分组依据
+```
+
+### 4.2 Windows/Mac 缓存
+
+**目录结构：**
+
+```
+根目录/
+├── {episode_id_1}/              ← 扁平结构，每集一个文件夹
+│   ├── {cid}.videoInfo          ← 元数据 JSON
+│   ├── 30280.m4s                ← 音频（固定文件名）
+│   ├── {quality_id}.m4s         ← 视频
+│   ├── {cid}.dm1                ← 弹幕文件
+│   ├── image.jpg                ← 分集封面
+│   └── group.jpg                ← 合集封面
+├── {episode_id_2}/
+│   └── ...
+```
+
+**.videoInfo 字段提取：**
+
+```python
+title = data.title or data.tabName or data.cid or data.bvid or data.aid
+p     = data.p
+group_id    = data.groupId       # JSON 中明确给出
+group_title = data.groupTitle
+```
+
+### 4.3 m4s 音视频判定算法
+
+当一个目录中有恰好 2 个 `.m4s` 文件时：
+
+```
+判定规则（按优先级）：
+1. 文件名以 "30280.m4s" 结尾 → 该文件是音频
+2. 否则，文件大小较小的 → 音频
+
+返回：(音频路径, 视频路径)
+
+如果不是恰好 2 个 m4s 文件 → 返回 None，该目录被跳过
+```
+
+> `30280` 是 B站音频流的固定 quality ID。视频流的 quality ID 随画质变化（如 80 = 1080P）。
+
+## 5. 解密算法
+
+### 适用范围
+
+仅 Windows/Mac 缓存的 m4s 文件需要解密。Android 缓存的 m4s 文件可直接被 ffmpeg 读取。
+
+### 原理
+
+Bilibili 在 2024 年 3 月后的 Windows/Mac 客户端中，对缓存的 m4s 文件头部添加了 `"000000000"` 填充。这不是真正的加密，只是破坏了文件头部的 MPEG-4 格式标识，使 ffmpeg 无法直接识别。
+
+### 算法步骤
+
+```
+输入：加密的 m4s 文件
+输出：可被 ffmpeg 读取的 m4s 文件
+
+1. 读取源文件的前 32 字节（文件头）
+2. 将 32 字节按 ASCII 解码为字符串（不可解码字节用 ? 替代）
+3. 从字符串中移除所有 "000000000"（9个零）
+4. 将处理后的字符串编码回 ASCII 字节
+5. 写入输出文件：处理后的头部 + 源文件剩余内容
+```
+
+### 伪代码
+
+```python
+def decrypt_pc_m4s(src_path, dst_path):
+    with open(src_path, "rb") as fin:
+        header = fin.read(32)                           # 步骤1
+        header_str = header.decode("ascii", "replace")  # 步骤2
+        header_str = header_str.replace("000000000", "")# 步骤3
+        clean_header = header_str.encode("ascii", "replace") # 步骤4
+
+        with open(dst_path, "wb") as fout:
+            fout.write(clean_header)                    # 步骤5a
+            while chunk := fin.read(256 * 1024 * 1024): # 步骤5b
+                fout.write(chunk)
+```
+
+### 关键细节
+
+- 头部替换后长度会**缩短**（原 32 字节 → 约 23 字节），输出文件比源文件短 9 字节
+- `replaceAll` 语义：如果头部中有多个 `"000000000"` 序列，全部移除
+- 后续字节不做任何处理，原样复制
+- 分块复制使用 256MB 缓冲区，处理大文件不会撑爆内存
+
+## 6. FFmpeg 命令
+
+### 音视频合并（带封面 + 元数据）
+
+当封面图存在时：
+
+```bash
+ffmpeg -y -i <音频> -i <视频> -i <封面.jpg> \
+  -map 0:a -map 1:v -map 2:v \
+  -c:a copy -c:v:0 copy -c:v:1 mjpeg \
+  -disposition:v:1 attached_pic \
+  -metadata title="标题" \
+  -metadata artist="UP主" \
+  -metadata album="合集名" \
+  -metadata track="1" \
+  -metadata comment="BV号" \
+  <输出.mp4>
+```
+
+| 参数 | 说明 |
+|------|------|
+| `-map 0:a -map 1:v -map 2:v` | 分别映射音频、视频、封面图三个输入流 |
+| `-c:v:0 copy` | 视频流直接复制（不重编码） |
+| `-c:v:1 mjpeg` | 封面图用 mjpeg 编码 |
+| `-disposition:v:1 attached_pic` | 标记封面为附加图片（播放器/资源管理器识别为缩略图） |
+| `-metadata key=value` | 嵌入 MP4 标准元数据（title/artist/album/track/comment） |
+
+无封面时回退：
+
+```bash
+ffmpeg -y -i <音频> -i <视频> -c copy -metadata title="标题" ... <输出.mp4>
+```
+
+封面嵌入失败时会自动回退到无封面命令。
+
+### 元数据映射关系
+
+| MP4 标签 | 数据来源 | 说明 |
+|----------|---------|------|
+| `title` | CacheItem.title | 视频标题 |
+| `artist` | CacheItem.owner_name | UP主名（Android: entry.json → owner_name） |
+| `album` | MergeTask.group_title | 合集标题 |
+| `track` | CacheItem.p | 分P/集数编号 |
+| `comment` | CacheItem.bv_id 或 av_id | B站视频标识符 |
+
+### BLV 分段拼接
+
+```bash
+ffmpeg -y -i "concat:<1.blv>|<2.blv>|<3.blv>" -c copy \
+  -metadata title="标题" ... <输出.mp4>
+```
+
+| 参数 | 说明 |
+|------|------|
+| `concat:` | ffmpeg 内置的拼接协议 |
+| `\|` | 文件分隔符 |
+| `-c copy` | 直接复制，不重新编码 |
+
+BLV 文件在拼接前会按文件名中的数字排序：
+
+```python
+# 排序规则：提取文件名中 "(\d+)\.blv" 的数字部分
+# 0.blv → 0, 1.blv → 1, 2.blv → 2, ...
+sorted(blv_paths, key=lambda p: int(re.search(r'(\d+)\.blv$', p).group(1)))
+```
+
+## 7. 多线程模型
+
+### 线程池
+
+```python
+ThreadPoolExecutor(max_workers=N)
+```
+
+- 每个 `MergeTask` 作为独立任务提交到线程池
+- 线程间无共享文件操作（每个任务输出路径唯一）
+- 任务状态字段（`status`、`error`）由各自线程写入，进度显示线程只读
+
+### 线程安全
+
+| 共享资源 | 保护方式 |
+|----------|----------|
+| 任务列表 | 构建阶段完成后只读，运行阶段不修改列表结构 |
+| 任务状态字段 | 每个字段只被一个工作线程写入 |
+| 进度显示 | `threading.Lock` 保护终端输出 |
+| 文件系统 | `get_available_path()` 使用 `threading.Lock` + 占位文件确保路径唯一 |
+
+### 进度显示
+
+- 独立守护线程，每 0.5 秒刷新
+- 使用 ANSI 转义序列（`\033[nA` 上移光标 + `\033[J` 清除）覆盖上次输出
+- 显示内容：总进度条 + 每个任务状态行
+- 编码安全：捕获 `UnicodeEncodeError`，GBK 终端下降级显示
+
+## 8. 容错 JSON 解析
+
+B站缓存的 JSON 文件偶尔存在格式问题（文件截断、多余逗号等）。解析策略：
+
+```
+第 1 次尝试：直接 json.loads()
+    ↓ 失败
+第 2 次尝试：修复后重试
+    ├── 移除尾逗号：  ,} → }    ,] → ]
+    ├── 移除首尾逗号
+    ├── 移除控制字符：\x00-\x1f
+    └── json.loads(fixed)
+    ↓ 失败
+第 3 次尝试：平衡括号后重试
+    ├── { 多于 } → 末尾补 }
+    ├── } 多于 { → 末尾删 }
+    ├── [ 和 ] 同理
+    └── json.loads(balanced)
+    ↓ 失败
+抛出异常，该缓存项被跳过
+```
+
+## 9. 文件名安全处理
+
+### 非法字符替换
+
+```python
+# Windows 非法字符：替换为下划线
+re.sub(r'[<>:"/\\|?*]', '_', filename)
+```
+
+### 首尾清理
+
+```python
+# 移除首尾空格和句点
+re.sub(r'^[ .]+|[ .]+$', '_', filename)
+```
+
+### Windows 保留名
+
+以下名称不能用作文件名，会自动加 `_` 前缀：
+
+```
+CON PRN AUX NUL
+COM1-COM9
+LPT1-LPT9
+```
+
+### 长度限制
+
+文件名超过 200 字符时截断（保留足够空间给路径和后缀）。
